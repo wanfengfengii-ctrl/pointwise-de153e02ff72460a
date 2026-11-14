@@ -22,6 +22,13 @@ def inspect(plist_path, app, root, python):
     return value["Label"]
 
 
+def live(label):
+    """Return the real launchctl state or raise if the agent is not loaded."""
+    result = subprocess.run(["launchctl", "print", "gui/%s/%s" % (os.getuid(), label)],
+                            text=True, capture_output=True, check=True)
+    return result.stdout
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("plist")
@@ -33,7 +40,5 @@ if __name__ == "__main__":
     label = inspect(args.plist, args.app, args.root, args.python)
     output = {"label": label, "plist_checked": True}
     if args.live:
-        result = subprocess.run(["launchctl", "print", "gui/%s/%s" % (os.getuid(), label)],
-                                text=True, capture_output=True, check=True)
-        output["launchctl"] = result.stdout
+        output["launchctl"] = live(label)
     print(json.dumps(output, ensure_ascii=False))

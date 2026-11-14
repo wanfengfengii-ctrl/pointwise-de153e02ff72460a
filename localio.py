@@ -1,4 +1,8 @@
-"""Local immutable payloads and deterministic process pause points."""
+"""Local immutable payloads and deterministic process pause points.
+
+With a quota attached, LocalBlobs delegates publication to Quota so that the
+complete object size is reserved before any byte is written.
+"""
 import contextlib
 import fcntl
 import hashlib
@@ -36,14 +40,17 @@ class Gate:
 
 
 class LocalBlobs:
-    def __init__(self, root, hook=None):
+    def __init__(self, root, hook=None, quota=None):
         self.directory = Path(root) / "blobs"
         self.directory.mkdir(parents=True, exist_ok=True)
         self.hook = hook or (lambda event, detail: None)
+        self.quota = quota
 
     def put(self, value):
         data = encoded(value)
         oid = hashlib.sha256(data).hexdigest()
+        if self.quota is not None:
+            return self.quota.put(data, oid, self.hook)
         fd, name = tempfile.mkstemp(prefix=".writing-", dir=str(self.directory))
         try:
             with os.fdopen(fd, "wb") as out:

@@ -1,4 +1,9 @@
-"""Existing build/install/worker entry point. Managed quota is not implemented."""
+"""Build/install/worker entry point with managed payload capacity.
+
+The installed artifact is self-contained: build embeds CORE plus __main__, and
+every command runs from the installed app.pyz with no source tree, current
+directory or PYTHONPATH dependency.
+"""
 import argparse
 import hashlib
 import io
@@ -13,8 +18,9 @@ import time
 import zipfile
 from pipeline import Engine, connect
 from localio import Gate, LocalBlobs, worker
+from quota import Quota
 
-CORE = ("ops.py", "pipeline.py", "localio.py")
+CORE = ("ops.py", "pipeline.py", "localio.py", "quota.py")
 
 
 def bundle(source):
@@ -84,22 +90,24 @@ def install(package, dest, python, no_load=False):
     return {"app": str(app), "root": str(root), "plist": str(plist), "label": label}
 
 
-def job(command, root, input_path=None, once=False):
+def job(command, root, input_path=None, once=False, quota=None):
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     hook = Gate()
     db = connect(root / "state.sqlite")
     try:
-        engine = Engine(db, LocalBlobs(root, hook), hook)
+        capacity = Quota(db, root)
+        engine = Engine(db, LocalBlobs(root, hook, capacity), hook)
+        if command == "quota":
+            capacity.set_limit(quota)
+            return engine.status()
         if command == "submit":
             with open(input_path, encoding="utf-8") as stream:
                 return engine.accept(json.load(stream))
         if command == "read":
             return engine.read()
         if command == "status":
-            result = engine.status()
-            result["inventory"] = engine.blobs.inventory()
-            return result
+            return engine.status()
         with worker(root):
             if once:
                 return {"progressed": engine.step()}
@@ -120,6 +128,9 @@ def main():
     p.add_argument("dest")
     p.add_argument("--python", required=True)
     p.add_argument("--no-load", action="store_true")
+    p = commands.add_parser("quota")
+    p.add_argument("root")
+    p.add_argument("bytes", type=int)
     for name in ("submit", "read", "status", "run"):
         p = commands.add_parser(name)
         p.add_argument("root")
@@ -134,7 +145,8 @@ def main():
         elif args.command == "install":
             result = install(args.package, args.dest, args.python, args.no_load)
         else:
-            result = job(args.command, args.root, getattr(args, "input", None), getattr(args, "once", False))
+            result = job(args.command, args.root, getattr(args, "input", None),
+                         getattr(args, "once", False), getattr(args, "bytes", None))
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     except (ValueError, OSError, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
         print(str(exc), file=sys.stderr)

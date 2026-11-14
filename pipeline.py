@@ -3,6 +3,8 @@ import hashlib
 import json
 import sqlite3
 
+from quota import QuotaError
+
 
 def encoded(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -88,15 +90,22 @@ class Engine:
     def __init__(self, db, blobs, hook=None):
         self.db, self.blobs = db, blobs
         self.hook = hook or (lambda event, detail: None)
+        self._rotate = None
         db.execute("""CREATE TABLE IF NOT EXISTS jobs(
             id TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
             checkpoint TEXT, result TEXT, receipt TEXT)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS job_pauses(
+            id TEXT PRIMARY KEY, reason TEXT NOT NULL)""")
         db.commit()
 
     def _put(self, value):
         oid = self.blobs.put(value)
         self.hook("object_ready", {"oid": oid})
         return oid
+
+    def _paused(self):
+        return {key: reason for key, reason in self.db.execute(
+            "SELECT id,reason FROM job_pauses")}
 
     def accept(self, batch):
         validate(batch)
@@ -132,22 +141,60 @@ class Engine:
         with self.db:
             self.db.execute("UPDATE jobs SET checkpoint=? WHERE id=?",
                             (encoded(cp).decode(), key))
+            self.db.execute("DELETE FROM job_pauses WHERE id=?", (key,))
         self.hook("after_checkpoint", {"batch": key})
 
+    def _pause(self, key):
+        if self._paused().get(key) == "QUOTA_PAUSED":
+            return  # already persisted; avoid rewriting it on every retry
+        with self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO job_pauses(id,reason) VALUES(?,?)",
+                (key, "QUOTA_PAUSED"))
+
+    def _pending(self, key):
+        if key is not None:
+            return [key] if self.db.execute(
+                "SELECT 1 FROM jobs WHERE id=? AND checkpoint IS NOT NULL",
+                (key,)).fetchone() else []
+        return [row[0] for row in self.db.execute(
+            "SELECT id FROM jobs WHERE checkpoint IS NOT NULL ORDER BY rowid")]
+
     def step(self, key=None):
-        if key is None:
-            row = self.db.execute(
-                "SELECT id,request_hash,checkpoint FROM jobs "
-                "WHERE checkpoint IS NOT NULL ORDER BY rowid LIMIT 1").fetchone()
-        else:
-            row = self.db.execute(
-                "SELECT id,request_hash,checkpoint FROM jobs "
-                "WHERE id=? AND checkpoint IS NOT NULL", (key,)).fetchone()
-        if row is None:
+        # The worker rotates through pending batches: one that ran out of
+        # capacity is marked paused and the next one gets a turn, so a
+        # blocked batch never starves batches that can advance with payloads
+        # already on disk.  A paused batch is retried on the next round, which
+        # is what lets a resident worker resume after the limit is raised.
+        candidates = self._pending(key)
+        if not candidates:
             return False
-        key, request_hash, cp_text = row
-        cp = json.loads(cp_text)
-        self.hook("checkpoint_loaded", {"batch": key, "checkpoint": cp})
+        start = 0
+        if self._rotate is not None and self._rotate in candidates:
+            start = candidates.index(self._rotate)
+        for offset in range(len(candidates)):
+            candidate = candidates[(start + offset) % len(candidates)]
+            row = self.db.execute(
+                "SELECT request_hash,checkpoint FROM jobs WHERE id=?",
+                (candidate,)).fetchone()
+            if row is None or row[1] is None:
+                continue
+            request_hash, cp_text = row
+            cp = json.loads(cp_text)
+            self.hook("checkpoint_loaded", {"batch": candidate, "checkpoint": cp})
+            self._rotate = candidate
+            try:
+                self._advance(candidate, request_hash, cp)
+            except QuotaError:
+                # Capacity ran out before the new payload could be reserved.
+                # The checkpoint was not written, so the batch stays exactly
+                # where it was; only the pause marker is persisted.
+                self._pause(candidate)
+                continue
+            return True
+        return False
+
+    def _advance(self, key, request_hash, cp):
         if cp["stage"] == "normalize":
             index = cp["index"]
             if index < len(cp["sources"]):
@@ -175,8 +222,8 @@ class Engine:
                 self.db.execute(
                     "UPDATE jobs SET result=?,receipt=?,checkpoint=NULL WHERE id=?",
                     (encoded(result).decode(), encoded(receipt).decode(), key))
+                self.db.execute("DELETE FROM job_pauses WHERE id=?", (key,))
             self.hook("after_finish", {"batch": key})
-        return True
 
     def drain(self):
         while self.step():
@@ -189,7 +236,17 @@ class Engine:
                     "SELECT id,result,receipt FROM jobs WHERE result IS NOT NULL ORDER BY id")]
 
     def status(self):
+        pauses = self._paused()
         checkpoints = self.checkpoints()
-        return {"pending": checkpoints, "completed": len(self.read()),
-                "required": sorted({oid for item in checkpoints
-                                    for oid in dependencies(item["checkpoint"])})}
+        for item in checkpoints:
+            item["pause_reason"] = pauses.get(item["batch"])
+        result = {"pending": checkpoints, "completed": len(self.read()),
+                  "required": sorted({oid for item in checkpoints
+                                      for oid in dependencies(item["checkpoint"])})}
+        quota = getattr(self.blobs, "quota", None)
+        if quota is None:
+            result.update({"limit": None, "published_bytes": 0,
+                           "reserved_bytes": 0, "inventory": {}})
+        else:
+            result.update(quota.capacity())
+        return result
