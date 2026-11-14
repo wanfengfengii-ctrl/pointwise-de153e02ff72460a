@@ -1,0 +1,18 @@
+{
+  "batch": "a",
+  "segments": [
+    [
+      {"id":"y","rev":1,"sensor":"s1","ts":20,"value":40,"deleted":false},
+      {"id":"x","rev":1,"sensor":"s1","ts":1,"value":100,"deleted":false}
+    ],
+    [
+      {"id":"x","rev":2,"sensor":"s2","ts":61,"value":-30,"deleted":false},
+      {"id":"y","rev":2,"sensor":"s1","ts":20,"value":40,"deleted":true},
+      {"id":"z","rev":1,"sensor":"s2","ts":80,"value":0,"deleted":false}
+    ],
+    [
+      {"id":"x","rev":1,"sensor":"s1","ts":1,"value":100,"deleted":false},
+      {"id":"w","rev":1,"sensor":"s1","ts":-1,"value":7,"deleted":false}
+    ]
+  ]
+}
